@@ -1,0 +1,54 @@
+name: 모닝 브리핑
+
+on:
+  schedule:
+    # 07:00 KST = 22:00 UTC 전날. 월~금(KST) = 일~목(UTC) 0-4
+    - cron: '0 22 * * 0-4'
+  workflow_dispatch:        # Actions 탭에서 수동 실행
+
+permissions:
+  contents: write
+
+concurrency:
+  group: brief
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: pip install -r requirements.txt
+
+      - name: 시장 데이터 수집
+        env:
+          ALPHAVANTAGE_KEY: ${{ secrets.ALPHAVANTAGE_KEY }}
+          FMP_KEY:          ${{ secrets.FMP_KEY }}
+          FINNHUB_KEY:      ${{ secrets.FINNHUB_KEY }}
+        run: python scripts/fetch_market.py
+
+      - name: 브리핑 생성
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python scripts/generate.py
+
+      - name: 커밋 및 배포
+        run: |
+          git config user.name  "morning-brief-bot"
+          git config user.email "actions@github.com"
+          git add docs/
+          git diff --staged --quiet || git commit -m "브리핑 $(TZ=Asia/Seoul date +%Y-%m-%d)"
+          git push
+
+      # ── 선택: 이메일 발송 (RESEND_API_KEY와 SUBSCRIBERS를 설정한 경우에만 동작) ──
+      - name: 구독자에게 발송
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          SUBSCRIBERS:    ${{ secrets.SUBSCRIBERS }}
+          FROM_ADDRESS:   ${{ secrets.FROM_ADDRESS }}
+        run: python scripts/send_email.py
