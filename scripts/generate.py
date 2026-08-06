@@ -31,7 +31,8 @@ PROMPT = f"""오늘은 {date_ko}(KST)입니다. 한국의 개인 투자자를 �
 - 커피가 월평균값이면 "월평균"이라고 명시하세요.
 - 톤: 관찰하고 건넨다. 응원하거나 하루를 평가하지 않습니다.
 
-아래 JSON 형식으로만 답하세요. 다른 텍스트는 넣지 마세요.
+답변은 반드시 ```json 코드펜스 하나로만 감싸고, 그 밖에는 아무 텍스트도 쓰지 마세요.
+문자열 안에 큰따옴표를 쓰지 말고 필요하면 작은따옴표를 쓰세요.
 {{
   "headline": "오늘 시장을 한 문장으로. 명조체로 크게 나갈 문장입니다.",
   "items": [
@@ -42,34 +43,56 @@ PROMPT = f"""오늘은 {date_ko}(KST)입니다. 한국의 개인 투자자를 �
 }}
 """
 
-# 서버측 웹 검색을 쓰면 API가 stop_reason="pause_turn"으로 턴을 끊는다.
-# 단발 호출만 하면 최종 텍스트가 비어 실패하므로, 끝날 때까지 이어서 호출한다.
-messages = [{"role": "user", "content": PROMPT}]
-chunks, stop, resp = [], None, None
+def _scan(s, offset=0):
+    """offset에서 시작해 문자열 리터럴을 존중하며 균형 잡힌 {...} 후보를 모은다."""
+    out, depth, start_i, in_str, esc = [], 0, None, False, False
+    for i in range(offset, len(s)):
+        ch = s[i]
+        if in_str:
+            if esc: esc = False
+            elif ch == "\\": esc = True
+            elif ch == '"': in_str = False
+            continue
+        if ch == '"': in_str = True
+        elif ch == "{":
+            if depth == 0: start_i = i
+            depth += 1
+        elif ch == "}" and depth:
+            depth -= 1
+            if depth == 0 and start_i is not None:
+                out.append(s[start_i:i + 1])
+    return out
 
-for turn in range(6):
-    resp = client.messages.create(
-        model="claude-sonnet-5",
-        max_tokens=8000,
-        tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 6}],
-        messages=messages,
-    )
-    stop = resp.stop_reason
-    chunks += [b.text for b in resp.content if b.type == "text"]
-    print(f"  턴 {turn + 1}: stop_reason={stop}, 블록 {len(resp.content)}개", flush=True)
-    if stop != "pause_turn":
-        break
-    messages.append({"role": "assistant", "content": resp.content})
 
-text = "\n".join(chunks)
-m = re.search(r"\{.*\}", text, re.S)
+def _ok(cand):
+    try:
+        d = json.loads(cand)
+        return d if isinstance(d, dict) and isinstance(d.get("items"), list) else None
+    except Exception:
+        return None
 
-if m:
-    brief = json.loads(m.group(0))
-else:
-    # 모델 응답을 못 쓰더라도 원시 수치는 보여준다. 빌드를 실패시키지 않는다.
-    print(f"! 모델이 JSON을 반환하지 않았습니다 (stop_reason={stop}). "
-          f"수집된 수치만으로 렌더링합니다.\n--- 응답 앞부분 ---\n{text[:600]}", flush=True)
+
+def extract_json(s):
+    if not s:
+        return None
+    # 1) 코드펜스가 있으면 그것부터
+    for m in re.finditer(r"```(?:json)?\s*(\{.*?\})\s*```", s, re.S):
+        if (d := _ok(m.group(1))):
+            return d
+    # 2) 전체 스캔 (뒤에서부터 — 최종 답변이 뒤에 있다)
+    for cand in reversed(_scan(s)):
+        if (d := _ok(cand)):
+            return d
+    # 3) 복구: 앞선 턴의 조각 때문에 따옴표 짝이 어긋난 경우,
+    #    "headline" 키가 나오는 지점마다 새로 스캔한다.
+    for m in re.finditer(r'\{\s*"headline"', s):
+        for cand in reversed(_scan(s, m.start())):
+            if (d := _ok(cand)):
+                return d
+    return None
+
+
+def fallback():
     items = []
     for v in market.get("items", {}).values():
         cp = v.get("change_pct")
@@ -77,12 +100,50 @@ else:
             "label": v.get("label", ""),
             "value": f"{v.get('price', '')}",
             "change": f"{cp:+.2f}%" if isinstance(cp, (int, float)) else "",
-            "dir": "flat" if not isinstance(cp, (int, float)) else ("up" if cp > 0 else "down" if cp < 0 else "flat"),
+            "dir": "flat" if not isinstance(cp, (int, float))
+                   else ("up" if cp > 0 else "down" if cp < 0 else "flat"),
             "body": v.get("note", ""),
         })
-    brief = {"headline": "자동 요약을 만들지 못해 수집된 수치만 표시합니다.",
-             "note": "해설 생성이 실패했습니다. Actions 로그를 확인하세요.",
-             "items": items}
+    return {"headline": "자동 요약을 만들지 못해 수집된 수치만 표시합니다.",
+            "note": "해설 생성이 실패했습니다. Actions 로그를 확인하세요.",
+            "items": items}
+
+
+# 서버측 웹 검색을 쓰면 API가 stop_reason="pause_turn"으로 턴을 끊는다.
+# 단발 호출만 하면 최종 텍스트가 비어 실패하므로 끝날 때까지 이어서 호출한다.
+brief, last_text = None, ""
+try:
+    messages = [{"role": "user", "content": PROMPT}]
+    turns = []
+    for n in range(6):
+        resp = client.messages.create(
+            model="claude-sonnet-5",
+            max_tokens=8000,
+            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 6}],
+            messages=messages,
+        )
+        turns.append("".join(b.text for b in resp.content if b.type == "text"))
+        print(f"  턴 {n+1}: stop_reason={resp.stop_reason}", flush=True)
+        if resp.stop_reason != "pause_turn":
+            break
+        messages.append({"role": "assistant", "content": resp.content})
+
+    # 최종 턴을 먼저 시도한다. 턴을 이어 붙이면 조각난 JSON이 섞여 파싱이 깨진다.
+    for text in ([turns[-1]] if turns else []) + ["\n".join(turns)]:
+        last_text = text
+        brief = extract_json(text)
+        if brief:
+            break
+except Exception as ex:
+    print(f"! API 호출 실패: {type(ex).__name__}: {ex}", flush=True)
+
+if brief:
+    print(f"  파싱 성공 — 항목 {len(brief.get('items', []))}개", flush=True)
+else:
+    pathlib.Path("raw_response.txt").write_text(last_text, encoding="utf-8")
+    print("! JSON 파싱 실패 — 수집된 수치만으로 렌더링합니다.\n"
+          f"--- 응답 앞부분 ---\n{last_text[:1200]}", flush=True)
+    brief = fallback()
 
 e = html.escape
 ARROW = {"up": "▲", "down": "▼", "flat": "―"}

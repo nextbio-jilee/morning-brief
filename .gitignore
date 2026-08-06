@@ -1,4 +1,5 @@
 market.json
+raw_response.txt
 __pycache__/
 *.pyc
 .env
