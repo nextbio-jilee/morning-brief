@@ -42,18 +42,47 @@ PROMPT = f"""오늘은 {date_ko}(KST)입니다. 한국의 개인 투자자를 �
 }}
 """
 
-resp = client.messages.create(
-    model="claude-sonnet-5",
-    max_tokens=4000,
-    tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 8}],
-    messages=[{"role": "user", "content": PROMPT}],
-)
+# 서버측 웹 검색을 쓰면 API가 stop_reason="pause_turn"으로 턴을 끊는다.
+# 단발 호출만 하면 최종 텍스트가 비어 실패하므로, 끝날 때까지 이어서 호출한다.
+messages = [{"role": "user", "content": PROMPT}]
+chunks, stop, resp = [], None, None
 
-text = "".join(b.text for b in resp.content if b.type == "text")
+for turn in range(6):
+    resp = client.messages.create(
+        model="claude-sonnet-5",
+        max_tokens=8000,
+        tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 6}],
+        messages=messages,
+    )
+    stop = resp.stop_reason
+    chunks += [b.text for b in resp.content if b.type == "text"]
+    print(f"  턴 {turn + 1}: stop_reason={stop}, 블록 {len(resp.content)}개", flush=True)
+    if stop != "pause_turn":
+        break
+    messages.append({"role": "assistant", "content": resp.content})
+
+text = "\n".join(chunks)
 m = re.search(r"\{.*\}", text, re.S)
-if not m:
-    raise SystemExit(f"모델이 JSON을 반환하지 않았습니다:\n{text[:800]}")
-brief = json.loads(m.group(0))
+
+if m:
+    brief = json.loads(m.group(0))
+else:
+    # 모델 응답을 못 쓰더라도 원시 수치는 보여준다. 빌드를 실패시키지 않는다.
+    print(f"! 모델이 JSON을 반환하지 않았습니다 (stop_reason={stop}). "
+          f"수집된 수치만으로 렌더링합니다.\n--- 응답 앞부분 ---\n{text[:600]}", flush=True)
+    items = []
+    for v in market.get("items", {}).values():
+        cp = v.get("change_pct")
+        items.append({
+            "label": v.get("label", ""),
+            "value": f"{v.get('price', '')}",
+            "change": f"{cp:+.2f}%" if isinstance(cp, (int, float)) else "",
+            "dir": "flat" if not isinstance(cp, (int, float)) else ("up" if cp > 0 else "down" if cp < 0 else "flat"),
+            "body": v.get("note", ""),
+        })
+    brief = {"headline": "자동 요약을 만들지 못해 수집된 수치만 표시합니다.",
+             "note": "해설 생성이 실패했습니다. Actions 로그를 확인하세요.",
+             "items": items}
 
 e = html.escape
 ARROW = {"up": "▲", "down": "▼", "flat": "―"}
