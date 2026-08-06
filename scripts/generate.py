@@ -13,36 +13,6 @@ docs = pathlib.Path("docs"); docs.mkdir(exist_ok=True)
 
 client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
-PROMPT = f"""오늘은 {date_ko}(KST)입니다. 한국의 개인 투자자를 위한 아침 시장 브리핑을 작성하세요.
-
-아래는 API로 확보한 확정 수치입니다. 이 숫자는 그대로 쓰고 절대 바꾸지 마세요.
-
-{json.dumps(market, ensure_ascii=False, indent=2)}
-
-`missing` 목록에 있는 항목은 API로 못 받은 것입니다. 웹 검색으로 어제자 수치를 찾아 채우세요.
-각 항목이 왜 그렇게 움직였는지 배경도 웹 검색으로 확인하세요.
-
-다룰 항목: 나스닥 종합·나스닥 100, S&P 500, 금, WTI·브렌트유, 원/달러, 아라비카 커피.
-
-규칙:
-- 전부 한국어. 지수명·티커·통화기호는 원문 유지.
-- 확인되지 않은 수치는 지어내지 말고 그 항목을 통째로 빼세요. 사과나 자리표시자를 남기지 마세요.
-- 매수·매도 판단, 목표가, 투자 권고를 절대 쓰지 마세요. 관측된 사실과 배경만 전달합니다.
-- 커피가 월평균값이면 "월평균"이라고 명시하세요.
-- 톤: 관찰하고 건넨다. 응원하거나 하루를 평가하지 않습니다.
-
-답변은 반드시 ```json 코드펜스 하나로만 감싸고, 그 밖에는 아무 텍스트도 쓰지 마세요.
-문자열 안에 큰따옴표를 쓰지 말고 필요하면 작은따옴표를 쓰세요.
-{{
-  "headline": "오늘 시장을 한 문장으로. 명조체로 크게 나갈 문장입니다.",
-  "items": [
-    {{"label": "나스닥 종합", "value": "24,442.94", "change": "-1.74%", "dir": "down",
-      "body": "왜 그렇게 움직였는지 한두 문장."}}
-  ],
-  "note": "전반을 관통하는 맥락 한두 문장. 없으면 빈 문자열."
-}}
-"""
-
 def _scan(s, offset=0):
     """offset에서 시작해 문자열 리터럴을 존중하며 균형 잡힌 {...} 후보를 모은다."""
     out, depth, start_i, in_str, esc = [], 0, None, False, False
@@ -92,6 +62,34 @@ def extract_json(s):
     return None
 
 
+RULES = """규칙:
+- 전부 한국어. 지수명·티커·통화기호는 원문 유지.
+- 확인되지 않은 수치는 지어내지 말고 그 항목을 통째로 빼세요.
+- 매수·매도 판단, 목표가, 투자 권고를 절대 쓰지 마세요. 관측된 사실과 배경만 전달합니다.
+- 커피가 월평균값이면 "월평균"이라고 명시하세요.
+- 톤: 관찰하고 건넨다. 응원하거나 하루를 평가하지 않습니다."""
+
+MARKET = json.dumps(market, ensure_ascii=False, indent=2)
+
+
+def call(prompt, max_tokens, tools=None, label=""):
+    """pause_turn을 처리하며 텍스트를 모은다. (텍스트, 마지막 stop_reason) 반환."""
+    messages = [{"role": "user", "content": prompt}]
+    turns, stop = [], None
+    for n in range(6):
+        kw = dict(model="claude-sonnet-5", max_tokens=max_tokens, messages=messages)
+        if tools:
+            kw["tools"] = tools
+        resp = client.messages.create(**kw)
+        stop = resp.stop_reason
+        turns.append("".join(b.text for b in resp.content if b.type == "text"))
+        print(f"  {label} 턴 {n+1}: stop_reason={stop}", flush=True)
+        if stop != "pause_turn":
+            break
+        messages.append({"role": "assistant", "content": resp.content})
+    return ("\n".join(turns), stop)
+
+
 def fallback():
     items = []
     for v in market.get("items", {}).values():
@@ -109,40 +107,67 @@ def fallback():
             "items": items}
 
 
-# 서버측 웹 검색을 쓰면 API가 stop_reason="pause_turn"으로 턴을 끊는다.
-# 단발 호출만 하면 최종 텍스트가 비어 실패하므로 끝날 때까지 이어서 호출한다.
-brief, last_text = None, ""
+brief, notes = None, ""
 try:
-    messages = [{"role": "user", "content": PROMPT}]
-    turns = []
-    for n in range(6):
-        resp = client.messages.create(
-            model="claude-sonnet-5",
-            max_tokens=8000,
-            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 6}],
-            messages=messages,
-        )
-        turns.append("".join(b.text for b in resp.content if b.type == "text"))
-        print(f"  턴 {n+1}: stop_reason={resp.stop_reason}", flush=True)
-        if resp.stop_reason != "pause_turn":
-            break
-        messages.append({"role": "assistant", "content": resp.content})
+    # ── 1단계: 검색으로 빠진 수치와 배경만 수집한다 (JSON을 만들지 않는다) ──
+    # 검색 결과가 응답 토큰을 잡아먹어 JSON 작성 중 max_tokens로 잘리는 것을 막기 위해 분리했다.
+    notes, _ = call(
+        f"""오늘은 {date_ko}(KST)입니다. 한국 개인 투자자용 아침 시장 브리핑에 쓸 자료를 조사하세요.
 
-    # 최종 턴을 먼저 시도한다. 턴을 이어 붙이면 조각난 JSON이 섞여 파싱이 깨진다.
-    for text in ([turns[-1]] if turns else []) + ["\n".join(turns)]:
-        last_text = text
-        brief = extract_json(text)
-        if brief:
-            break
+이미 확보한 수치입니다 (이 숫자는 정확하니 다시 찾지 마세요):
+{MARKET}
+
+`missing`에 있는 항목만 웹 검색으로 어제자 수치를 찾으세요.
+그리고 나스닥·S&P500·유가·환율·금·커피가 어제 왜 그렇게 움직였는지 배경을 확인하세요.
+
+결과를 짧은 메모 형식으로 정리하세요. 항목당 두 줄을 넘기지 마세요.
+JSON으로 만들지 말고 평문 메모로만 쓰세요.""",
+        max_tokens=6000,
+        tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
+        label="조사")
+
+    # ── 2단계: 검색 없이 JSON만 작성한다. 토큰 예산을 온전히 쓴다. ──
+    text, stop = call(
+        f"""아래 자료로 한국어 아침 시장 브리핑을 만드세요.
+
+확정 수치 (그대로 사용):
+{MARKET}
+
+조사 메모:
+{notes[:6000]}
+
+{RULES}
+
+다룰 항목: 나스닥 종합, 나스닥 100, S&P 500, 금, WTI, 브렌트유, 원/달러, 아라비카 커피.
+자료에 없는 항목은 빼세요.
+
+답변은 ```json 코드펜스 하나로만 감싸고 그 밖에는 아무것도 쓰지 마세요.
+문자열 안에 큰따옴표를 쓰지 말고 필요하면 작은따옴표를 쓰세요.
+각 body는 두 문장 이내로 짧게 쓰세요.
+{{
+  "headline": "오늘 시장을 한 문장으로",
+  "items": [
+    {{"label": "나스닥 종합", "value": "24,442.94", "change": "-1.74%", "dir": "down",
+      "body": "왜 그렇게 움직였는지 한두 문장"}}
+  ],
+  "note": "전반을 관통하는 맥락 한두 문장. 없으면 빈 문자열"
+}}""",
+        max_tokens=8000, label="작성")
+
+    if stop == "max_tokens":
+        print("  ! 작성이 max_tokens로 잘렸습니다", flush=True)
+    brief = extract_json(text)
 except Exception as ex:
     print(f"! API 호출 실패: {type(ex).__name__}: {ex}", flush=True)
+    text = ""
 
 if brief:
     print(f"  파싱 성공 — 항목 {len(brief.get('items', []))}개", flush=True)
 else:
-    pathlib.Path("raw_response.txt").write_text(last_text, encoding="utf-8")
+    pathlib.Path("raw_response.txt").write_text(
+        f"=== 조사 ===\n{notes}\n\n=== 작성 ===\n{locals().get('text','')}", encoding="utf-8")
     print("! JSON 파싱 실패 — 수집된 수치만으로 렌더링합니다.\n"
-          f"--- 응답 앞부분 ---\n{last_text[:1200]}", flush=True)
+          f"--- 작성 응답 앞부분 ---\n{locals().get('text','')[:1200]}", flush=True)
     brief = fallback()
 
 e = html.escape
